@@ -1,0 +1,7 @@
+interface:
+  display_name: "Claude/OpenCode Worker"
+  short_description: "Delegate coding work to local worker CLIs"
+  default_prompt: "Use $opencode-worker to delegate mechanical coding work to Claude Code CLI or OpenCode in an isolated worktree."
+
+policy:
+  allow_implicit_invocation: true
