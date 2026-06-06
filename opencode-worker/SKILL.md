@@ -71,7 +71,6 @@ $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
   -ClaudePath "C:/Users/孙钰涛/AppData/Roaming/npm/claude.cmd" `
   -Model "sonnet" `
   -PermissionMode auto `
-  -MaxBudgetUsd "0.50" `
   -Task "Inspect the failing test, make the smallest fix, run the relevant test, and summarize the result."
 ```
 
@@ -84,11 +83,11 @@ Parameters:
 - `-ClaudePath`: optional explicit path to `claude.cmd`; on Windows prefer `$env:APPDATA/npm/claude.cmd`. The helper skips PowerShell shims such as `claude.ps1` because they cannot be launched directly by `ProcessStartInfo`.
 - `-Model`: for Claude defaults to `$env:CLAUDE_WORKER_MODEL` or `sonnet`; for OpenCode defaults to `$env:OPENCODE_WORKER_MODEL` and must be set.
 - `-PermissionMode`: Claude permission mode. Defaults to `auto`.
-- `-MaxBudgetUsd`: Claude budget cap. Defaults to `$env:CLAUDE_WORKER_MAX_BUDGET_USD` or `0.50`.
+- `-MaxBudgetUsd`: optional Claude budget cap. If unset and `$env:CLAUDE_WORKER_MAX_BUDGET_USD` is unset, the helper does not pass `--max-budget-usd`.
 - `-Agent`: OpenCode agent name. Defaults to `build`.
 - `-TimeoutSec`: worker timeout in seconds. Defaults to `1800`.
-- `-NoLiveOutput`: suppress live streaming and write only logs plus final JSON.
-- `-RawLiveOutput`: show raw worker stdout instead of filtered Claude progress summaries.
+- `-NoLiveOutput`: suppress live streaming and write only logs plus final JSON. Avoid this for first runs or debugging unless the user prefers quiet terminals.
+- `-RawLiveOutput`: show raw worker stdout instead of filtered Claude progress summaries. Use this only when diagnosing stream parsing or missing live details.
 - `-KeepWorktree`: preserve the worktree for failures or manual inspection.
 
 The helper returns JSON with `run_id`, `backend`, `worker_command`, `worker_exit_code`, `branch`, `worktree`, `changed_files`, `diff_stat`, `log_path`, and `report_path`.
@@ -119,6 +118,14 @@ When triggered:
 ## Cost Rules
 
 - Use Claude backend by default because the user's Windows OpenCode TUI/CLI may fail on Bun/OpenTUI native DLL loading.
-- Keep Claude budget small for worker tasks. Start with `0.50` or lower for smoke tests.
-- Use `0.30` only for very narrow mechanical tasks. Use `0.50` for tasks that read several docs, edit files, and run verification.
+- Do not pass a Claude budget cap by default when the user routes Claude Code to a cheaper third-party model such as ccswitch/Mimo. In that setup, scope, timeout, and review are the useful controls.
+- Use `-MaxBudgetUsd` only when the user explicitly asks for a cap, or when using a metered official Claude account where accidental spend matters.
+- Treat budget exits as real failed worker runs, not as acceptable warnings.
+- Make the outer Codex shell timeout at least 120 seconds longer than `-TimeoutSec`, so the helper can kill the worker and write `report.json` itself.
 - Never rely on OpenCode's default model. Require `-Model` or `OPENCODE_WORKER_MODEL` for `-Backend opencode`.
+
+## Visibility Rules
+
+- Default to filtered live output so the user can see Claude Code start, tool calls, concise text, result, and cost.
+- Use `-NoLiveOutput` only after the worker path is trusted or when output noise is the bigger cost.
+- Use `-RawLiveOutput` for debugging raw stream-json behavior, not for normal development.

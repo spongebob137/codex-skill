@@ -243,6 +243,24 @@ function Invoke-WorkerProcess {
 
     $script:claudeLiveBuffer = ""
 
+    function Get-EventProperty {
+        param(
+            [AllowNull()]$Object,
+            [Parameter(Mandatory = $true)][string]$Name
+        )
+
+        if ($null -eq $Object) {
+            return $null
+        }
+
+        $property = $Object.PSObject.Properties[$Name]
+        if ($property) {
+            return $property.Value
+        }
+
+        return $null
+    }
+
     function Write-ClaudeLiveLine {
         param([string]$Line)
 
@@ -267,11 +285,14 @@ function Invoke-WorkerProcess {
                 if ($item.type -eq "text" -and $item.text) {
                     [Console]::Out.WriteLine("[claude] $($item.text)")
                 } elseif ($item.type -eq "tool_use") {
+                    $input = Get-EventProperty -Object $item -Name "input"
+                    $filePath = Get-EventProperty -Object $input -Name "file_path"
+                    $command = Get-EventProperty -Object $input -Name "command"
                     $target = ""
-                    if ($item.input -and $item.input.file_path) {
-                        $target = " $($item.input.file_path)"
-                    } elseif ($item.input -and $item.input.command) {
-                        $target = " $($item.input.command)"
+                    if ($filePath) {
+                        $target = " $filePath"
+                    } elseif ($command) {
+                        $target = " $command"
                     }
                     [Console]::Out.WriteLine("[claude tool] $($item.name)$target")
                 }
@@ -279,20 +300,33 @@ function Invoke-WorkerProcess {
             return
         }
 
-        if ($event.type -eq "user" -and $event.tool_use_result) {
-            $result = $event.tool_use_result
-            if ($result.filePath) {
-                [Console]::Out.WriteLine("[claude tool-result] $($result.type) $($result.filePath)")
-            } elseif ($result.stdout) {
+        $toolUseResult = Get-EventProperty -Object $event -Name "tool_use_result"
+        if ($event.type -eq "user" -and $toolUseResult) {
+            $resultType = Get-EventProperty -Object $toolUseResult -Name "type"
+            $filePath = Get-EventProperty -Object $toolUseResult -Name "filePath"
+            if (-not $filePath) {
+                $file = Get-EventProperty -Object $toolUseResult -Name "file"
+                $filePath = Get-EventProperty -Object $file -Name "filePath"
+            }
+
+            $stdout = Get-EventProperty -Object $toolUseResult -Name "stdout"
+            if ($filePath) {
+                [Console]::Out.WriteLine("[claude tool-result] $resultType $filePath")
+            } elseif ($stdout) {
                 [Console]::Out.WriteLine("[claude tool-result] stdout")
+            } elseif ($resultType) {
+                [Console]::Out.WriteLine("[claude tool-result] $resultType")
             }
             return
         }
 
         if ($event.type -eq "result") {
-            $cost = if ($null -ne $event.total_cost_usd) { " cost=$($event.total_cost_usd)" } else { "" }
-            $summary = if ($event.result) { " $($event.result)" } else { "" }
-            [Console]::Out.WriteLine("[claude result] $($event.subtype)$cost$summary")
+            $costValue = Get-EventProperty -Object $event -Name "total_cost_usd"
+            $resultText = Get-EventProperty -Object $event -Name "result"
+            $subtype = Get-EventProperty -Object $event -Name "subtype"
+            $cost = if ($null -ne $costValue) { " cost=$costValue" } else { "" }
+            $summary = if ($resultText) { " $resultText" } else { "" }
+            [Console]::Out.WriteLine("[claude result] $subtype$cost$summary")
         }
     }
 
@@ -394,16 +428,17 @@ function Invoke-WorkerProcess {
     }
 }
 
-if (-not $MaxBudgetUsd -or [string]::IsNullOrWhiteSpace($MaxBudgetUsd)) {
-    $MaxBudgetUsd = "0.50"
-}
-
 if (-not $Model -or [string]::IsNullOrWhiteSpace($Model)) {
     if ($Backend -eq "claude") {
         $Model = if ($env:CLAUDE_WORKER_MODEL) { $env:CLAUDE_WORKER_MODEL } else { "sonnet" }
     } else {
         $Model = $env:OPENCODE_WORKER_MODEL
     }
+}
+
+$claudeBudget = $null
+if ($Backend -eq "claude" -and $MaxBudgetUsd -and -not [string]::IsNullOrWhiteSpace($MaxBudgetUsd)) {
+    $claudeBudget = $MaxBudgetUsd.Trim()
 }
 
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
@@ -430,7 +465,7 @@ $report = @{
     opencode_exit_code = $null
     model = $Model
     permission_mode = if ($Backend -eq "claude") { $PermissionMode } else { $null }
-    max_budget_usd = if ($Backend -eq "claude") { $MaxBudgetUsd } else { $null }
+    max_budget_usd = if ($Backend -eq "claude") { $claudeBudget } else { $null }
     live_output = $liveOutput
     raw_live_output = $RawLiveOutput.IsPresent
     worker_command = @()
@@ -542,9 +577,11 @@ $taskContent
             "--verbose",
             "--permission-mode", $PermissionMode,
             "--model", $Model,
-            "--max-budget-usd", $MaxBudgetUsd,
             "--no-session-persistence"
         )
+        if ($claudeBudget) {
+            $workerArgs += @("--max-budget-usd", $claudeBudget)
+        }
         $stdinText = $workerBrief
     } else {
         $workerCommand = Resolve-OpenCodeCommand
