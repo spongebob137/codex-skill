@@ -94,7 +94,10 @@ Parameters:
 - `-TaskFile`: path to a UTF-8 file containing worker instructions.
 - `-Backend`: `claude` by default, or `opencode`.
 - `-ClaudePath`: optional explicit path to `claude.cmd`; on Windows prefer `$env:APPDATA/npm/claude.cmd`. The helper skips PowerShell shims such as `claude.ps1` because they cannot be launched directly by `ProcessStartInfo`.
-- `-Model`: for Claude defaults to `$env:CLAUDE_WORKER_MODEL` or `sonnet`; for OpenCode defaults to `$env:OPENCODE_WORKER_MODEL` and must be set.
+- `-OpenCodeMode`: `auto`, `windows`, or `wsl`. Use `wsl` for the user's WSL2 install.
+- `-OpenCodePath`: explicit OpenCode executable. For WSL mode use a Linux path such as `/home/yutao/.nvm/versions/node/v22.22.3/bin/opencode`.
+- `-OpenCodeSkipPermissions`: defaults to `true`; passes `--dangerously-skip-permissions` for non-interactive OpenCode worker runs.
+- `-Model`: for Claude defaults to `$env:CLAUDE_WORKER_MODEL` or `sonnet`; for OpenCode defaults to `$env:OPENCODE_WORKER_MODEL` or `opencode/mimo-v2.5-free`.
 - `-PermissionMode`: Claude permission mode. Defaults to `auto`.
 - `-MaxBudgetUsd`: optional Claude budget cap. If unset and `$env:CLAUDE_WORKER_MAX_BUDGET_USD` is unset, the helper does not pass `--max-budget-usd`.
 - `-Agent`: OpenCode agent name. Defaults to `build`.
@@ -105,6 +108,27 @@ Parameters:
 - `-KeepWorktree`: preserve the worktree for failures or manual inspection.
 
 The helper returns JSON with `run_id`, `backend`, `worker_command`, `worker_exit_code`, `branch`, `worktree`, `changed_files`, `diff_stat`, `log_path`, `report_path`, `last_output_at`, `last_event_summary`, `last_tool_name`, and `last_tool_target`.
+
+## OpenCode On WSL
+
+Use `-Backend opencode` when the user's WSL OpenCode is configured and a task should avoid Claude Code CLI/ccswitch latency. Prefer the WSL install over Windows PATH functions because PowerShell profile functions are not reliable inside non-interactive helper processes.
+
+Known working WSL command shape:
+
+```powershell
+$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+& "C:/Users/孙钰涛/.codex/skills/opencode-worker/scripts/invoke-opencode-worker.ps1" `
+  -Repo "D:/download/astrbot" `
+  -Backend opencode `
+  -OpenCodeMode wsl `
+  -OpenCodePath "/home/yutao/.nvm/versions/node/v22.22.3/bin/opencode" `
+  -Model "opencode/mimo-v2.5-free" `
+  -Task "Read package.json, make the smallest requested change, and summarize changed files."
+```
+
+For WSL mode, the helper keeps git worktrees on Windows and converts repo/task paths to WSL paths with `wslpath` before calling `opencode run`.
+
+OpenCode treats `--file` as an array option, so any positional message after `--file` can be parsed as another file path. Keep the worker prompt before `--file` in helper code.
 
 ## Review Rules
 
@@ -133,12 +157,13 @@ When triggered:
 ## Cost Rules
 
 - Use Claude backend by default because the user's Windows OpenCode TUI/CLI may fail on Bun/OpenTUI native DLL loading.
+- Use `-Backend opencode -OpenCodeMode wsl` when WSL OpenCode is configured; it avoids Windows Bun/OpenTUI issues and can be faster than Claude Code through ccswitch.
 - Do not pass a Claude budget cap by default when the user routes Claude Code to a cheaper third-party model such as ccswitch/Mimo. In that setup, scope, timeout, and review are the useful controls.
 - Use `-MaxBudgetUsd` only when the user explicitly asks for a cap, or when using a metered official Claude account where accidental spend matters.
 - Treat budget exits as real failed worker runs, not as acceptable warnings.
 - Make the outer Codex shell timeout at least 120 seconds longer than `-TimeoutSec`, so the helper can kill the worker and write `report.json` itself.
 - Keep `IdleTimeoutSec` enabled for exploratory worker runs. It catches stalled model/tool behavior faster than the total timeout.
-- Never rely on OpenCode's default model. Require `-Model` or `OPENCODE_WORKER_MODEL` for `-Backend opencode`.
+- Prefer an explicit OpenCode model. `opencode/mimo-v2.5-free` has been smoke-tested for WSL worker read/write. If using `xiaomi/...` models, verify provider auth first; `401 Invalid API Key` means OpenCode configuration must be fixed before delegating.
 
 ## Visibility Rules
 

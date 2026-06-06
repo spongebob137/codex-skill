@@ -9,6 +9,11 @@ param(
     [ValidateSet("claude", "opencode")]
     [string]$Backend = "claude",
 
+    [ValidateSet("auto", "windows", "wsl")]
+    [string]$OpenCodeMode = $(if ($env:OPENCODE_WORKER_MODE) { $env:OPENCODE_WORKER_MODE } else { "auto" }),
+
+    [string]$OpenCodePath = $env:OPENCODE_WORKER_PATH,
+
     [string]$ClaudePath,
 
     [string]$Model,
@@ -23,6 +28,8 @@ param(
     [int]$TimeoutSec = 1800,
 
     [int]$IdleTimeoutSec = 300,
+
+    [bool]$OpenCodeSkipPermissions = $true,
 
     [switch]$NoLiveOutput,
 
@@ -144,17 +151,83 @@ function Resolve-ClaudeCommand {
 }
 
 function Resolve-OpenCodeCommand {
+    param(
+        [string]$ExplicitPath,
+        [ValidateSet("auto", "windows", "wsl")][string]$Mode = "auto"
+    )
+
+    if ($Mode -in @("auto", "wsl")) {
+        $wslExe = Get-Command wsl.exe -ErrorAction SilentlyContinue
+        if ($wslExe) {
+            $wslCandidates = @()
+            if ($ExplicitPath -and $ExplicitPath.StartsWith("/")) {
+                $wslCandidates += $ExplicitPath
+            }
+            if ($env:OPENCODE_WORKER_WSL_PATH) {
+                $wslCandidates += $env:OPENCODE_WORKER_WSL_PATH
+            }
+            $wslCandidates += "/home/yutao/.nvm/versions/node/v22.22.3/bin/opencode"
+
+            foreach ($candidate in ($wslCandidates | Where-Object { $_ } | Select-Object -Unique)) {
+                & $wslExe.Source -e test -x $candidate 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    return @{
+                        mode = "wsl"
+                        command = $wslExe.Source
+                        opencode_path = $candidate
+                    }
+                }
+            }
+        }
+    }
+
+    if ($Mode -eq "wsl") {
+        return $null
+    }
+
+    if ($ExplicitPath -and -not $ExplicitPath.StartsWith("/") -and (Test-Path -LiteralPath $ExplicitPath -PathType Leaf)) {
+        return @{
+            mode = "windows"
+            command = (Resolve-Path -LiteralPath $ExplicitPath).Path
+            opencode_path = $null
+        }
+    }
+
     $opencode = Get-Command opencode -ErrorAction SilentlyContinue
-    if ($opencode) {
-        return $opencode.Source
+    if ($opencode -and $opencode.Source) {
+        return @{
+            mode = "windows"
+            command = $opencode.Source
+            opencode_path = $null
+        }
     }
 
     $opencodeCmd = Get-Command opencode.cmd -ErrorAction SilentlyContinue
     if ($opencodeCmd) {
-        return $opencodeCmd.Source
+        return @{
+            mode = "windows"
+            command = $opencodeCmd.Source
+            opencode_path = $null
+        }
     }
 
     return $null
+}
+
+function ConvertTo-WslPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $wslExe = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wslExe) {
+        throw "wsl.exe was not found, but OpenCode mode requires WSL."
+    }
+
+    $output = & $wslExe.Source -e wslpath -a $Path 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not $output) {
+        throw "wslpath failed for ${Path}: $($output -join [Environment]::NewLine)"
+    }
+
+    return [string](@($output)[0])
 }
 
 function Invoke-QuickProcess {
@@ -514,7 +587,7 @@ if (-not $Model -or [string]::IsNullOrWhiteSpace($Model)) {
     if ($Backend -eq "claude") {
         $Model = if ($env:CLAUDE_WORKER_MODEL) { $env:CLAUDE_WORKER_MODEL } else { "sonnet" }
     } else {
-        $Model = $env:OPENCODE_WORKER_MODEL
+        $Model = if ($env:OPENCODE_WORKER_MODEL) { $env:OPENCODE_WORKER_MODEL } else { "opencode/mimo-v2.5-free" }
     }
 }
 
@@ -548,6 +621,9 @@ $report = @{
     model = $Model
     permission_mode = if ($Backend -eq "claude") { $PermissionMode } else { $null }
     max_budget_usd = if ($Backend -eq "claude") { $claudeBudget } else { $null }
+    opencode_mode = if ($Backend -eq "opencode") { $OpenCodeMode } else { $null }
+    opencode_path = if ($Backend -eq "opencode") { $OpenCodePath } else { $null }
+    opencode_skip_permissions = if ($Backend -eq "opencode") { $OpenCodeSkipPermissions } else { $null }
     idle_timeout_sec = $IdleTimeoutSec
     live_output = $liveOutput
     raw_live_output = $RawLiveOutput.IsPresent
@@ -673,10 +749,10 @@ $taskContent
         }
         $stdinText = $workerBrief
     } else {
-        $workerCommand = Resolve-OpenCodeCommand
-        if (-not $workerCommand) {
+        $opencodeCommand = Resolve-OpenCodeCommand -ExplicitPath $OpenCodePath -Mode $OpenCodeMode
+        if (-not $opencodeCommand) {
             $report.status = "missing_opencode"
-            $report.message = "opencode was not found on PATH. Install and configure OpenCode first; this helper will not install global tools automatically."
+            $report.message = "opencode was not found. Pass -OpenCodePath, set OPENCODE_WORKER_PATH, or use -OpenCodeMode wsl with a valid WSL opencode path."
             Write-ReportAndExit -Report $report -Code 127
         }
 
@@ -686,14 +762,45 @@ $taskContent
             Write-ReportAndExit -Report $report -Code 2
         }
 
-        $workerArgs = @(
-            "run",
-            "--dir", $worktree,
-            "--agent", $Agent,
-            "--model", $Model,
-            "--file", $taskPath,
-            "--format", "json"
-        )
+        $report.opencode_mode = $opencodeCommand.mode
+        $report.opencode_path = $opencodeCommand.opencode_path
+
+        if ($opencodeCommand.mode -eq "wsl") {
+            $workerCommand = $opencodeCommand.command
+            $wslWorktree = ConvertTo-WslPath -Path $worktree
+            $wslTaskPath = ConvertTo-WslPath -Path $taskPath
+            $workerArgs = @(
+                "-e", $opencodeCommand.opencode_path,
+                "run",
+                "Read the attached worker task file and execute it exactly. Keep the final response concise.",
+                "--dir", $wslWorktree,
+                "--agent", $Agent,
+                "--model", $Model,
+                "--format", "json"
+            )
+            if ($OpenCodeSkipPermissions) {
+                $workerArgs += "--dangerously-skip-permissions"
+            }
+            $workerArgs += @(
+                "--file", $wslTaskPath
+            )
+        } else {
+            $workerCommand = $opencodeCommand.command
+            $workerArgs = @(
+                "run",
+                "Read the attached worker task file and execute it exactly. Keep the final response concise.",
+                "--dir", $worktree,
+                "--agent", $Agent,
+                "--model", $Model,
+                "--format", "json"
+            )
+            if ($OpenCodeSkipPermissions) {
+                $workerArgs += "--dangerously-skip-permissions"
+            }
+            $workerArgs += @(
+                "--file", $taskPath
+            )
+        }
     }
 
     $report.worker_command = @($workerCommand) + $workerArgs
