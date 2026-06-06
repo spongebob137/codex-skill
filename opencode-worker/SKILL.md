@@ -59,6 +59,19 @@ Do not use this skill when a direct Codex edit is cheaper than delegation, such 
 6. Review the worker output. Accept only if the diff is scoped, checks make sense, and no sensitive files were changed.
 7. Apply or merge the worker result only after Codex review. The helper never merges into the main worktree automatically.
 
+## Task Sizing
+
+Large feature briefs should be split before delegation, especially UI work where the worker may need to generate long TSX/CSS files.
+
+Prefer staged worker calls:
+
+1. Skeleton and navigation only.
+2. Data helpers or focused business logic only.
+3. One UI section at a time.
+4. Verification and small fixes only.
+
+Do not ask a worker to design, implement, style, and fully verify a whole dashboard or page in one run. Codex should make the design decisions, then delegate bounded slices that can be reviewed by diff.
+
 ## Helper Command
 
 Use PowerShell with UTF-8 output:
@@ -86,11 +99,12 @@ Parameters:
 - `-MaxBudgetUsd`: optional Claude budget cap. If unset and `$env:CLAUDE_WORKER_MAX_BUDGET_USD` is unset, the helper does not pass `--max-budget-usd`.
 - `-Agent`: OpenCode agent name. Defaults to `build`.
 - `-TimeoutSec`: worker timeout in seconds. Defaults to `1800`.
+- `-IdleTimeoutSec`: seconds with no stdout/stderr before the helper kills the worker as `idle_timeout`. Defaults to `300`; set `0` to disable.
 - `-NoLiveOutput`: suppress live streaming and write only logs plus final JSON. Avoid this for first runs or debugging unless the user prefers quiet terminals.
 - `-RawLiveOutput`: show raw worker stdout instead of filtered Claude progress summaries. Use this only when diagnosing stream parsing or missing live details.
 - `-KeepWorktree`: preserve the worktree for failures or manual inspection.
 
-The helper returns JSON with `run_id`, `backend`, `worker_command`, `worker_exit_code`, `branch`, `worktree`, `changed_files`, `diff_stat`, `log_path`, and `report_path`.
+The helper returns JSON with `run_id`, `backend`, `worker_command`, `worker_exit_code`, `branch`, `worktree`, `changed_files`, `diff_stat`, `log_path`, `report_path`, `last_output_at`, `last_event_summary`, `last_tool_name`, and `last_tool_target`.
 
 ## Review Rules
 
@@ -100,6 +114,7 @@ The helper returns JSON with `run_id`, `backend`, `worker_command`, `worker_exit
 - Reject or rework outputs that turn a failed verification command into an "accepted warning" without Codex making that decision.
 - If the worker exits nonzero, treat its output as a draft only.
 - If no files changed, do not spend Codex context debugging long logs unless the user asks.
+- If status is `idle_timeout`, inspect `last_event_summary`, `last_tool_name`, and `diff_stat` before opening logs. Split the task smaller before retrying.
 - Keep the worktree until Codex has finished reviewing or transferring the accepted patch.
 
 ## Self-Improvement Loop
@@ -122,6 +137,7 @@ When triggered:
 - Use `-MaxBudgetUsd` only when the user explicitly asks for a cap, or when using a metered official Claude account where accidental spend matters.
 - Treat budget exits as real failed worker runs, not as acceptable warnings.
 - Make the outer Codex shell timeout at least 120 seconds longer than `-TimeoutSec`, so the helper can kill the worker and write `report.json` itself.
+- Keep `IdleTimeoutSec` enabled for exploratory worker runs. It catches stalled model/tool behavior faster than the total timeout.
 - Never rely on OpenCode's default model. Require `-Model` or `OPENCODE_WORKER_MODEL` for `-Backend opencode`.
 
 ## Visibility Rules

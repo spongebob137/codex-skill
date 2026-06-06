@@ -22,6 +22,8 @@ param(
 
     [int]$TimeoutSec = 1800,
 
+    [int]$IdleTimeoutSec = 300,
+
     [switch]$NoLiveOutput,
 
     [switch]$RawLiveOutput,
@@ -205,6 +207,7 @@ function Invoke-WorkerProcess {
         [Parameter(Mandatory = $true)][string]$StdoutPath,
         [Parameter(Mandatory = $true)][string]$StderrPath,
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][int]$IdleTimeoutSeconds,
         [string]$StandardInputText,
         [bool]$LiveOutput,
         [bool]$RawLiveOutput,
@@ -242,6 +245,40 @@ function Invoke-WorkerProcess {
     }
 
     $script:claudeLiveBuffer = ""
+    $script:opencodeWorkerLastEventSummary = ""
+    $script:opencodeWorkerLastToolName = ""
+    $script:opencodeWorkerLastToolTarget = ""
+
+    function Limit-EventText {
+        param([AllowNull()][string]$Text)
+
+        if ([string]::IsNullOrWhiteSpace($Text)) {
+            return ""
+        }
+
+        $singleLine = ($Text -replace "\s+", " ").Trim()
+        if ($singleLine.Length -le 500) {
+            return $singleLine
+        }
+
+        return "$($singleLine.Substring(0, 497))..."
+    }
+
+    function Set-LastWorkerEvent {
+        param(
+            [Parameter(Mandatory = $true)][string]$Summary,
+            [string]$ToolName = "",
+            [string]$ToolTarget = ""
+        )
+
+        $script:opencodeWorkerLastEventSummary = Limit-EventText -Text $Summary
+        if ($ToolName) {
+            $script:opencodeWorkerLastToolName = $ToolName
+        }
+        if ($ToolTarget) {
+            $script:opencodeWorkerLastToolTarget = Limit-EventText -Text $ToolTarget
+        }
+    }
 
     function Get-EventProperty {
         param(
@@ -272,11 +309,13 @@ function Invoke-WorkerProcess {
             $event = $Line | ConvertFrom-Json -ErrorAction Stop
         } catch {
             [Console]::Out.WriteLine("[claude] $Line")
+            Set-LastWorkerEvent -Summary "raw stdout: $Line"
             return
         }
 
         if ($event.type -eq "system" -and $event.subtype -eq "init") {
             [Console]::Out.WriteLine("[claude] started model=$($event.model) cwd=$($event.cwd)")
+            Set-LastWorkerEvent -Summary "init model=$($event.model) cwd=$($event.cwd)"
             return
         }
 
@@ -284,6 +323,7 @@ function Invoke-WorkerProcess {
             foreach ($item in @($event.message.content)) {
                 if ($item.type -eq "text" -and $item.text) {
                     [Console]::Out.WriteLine("[claude] $($item.text)")
+                    Set-LastWorkerEvent -Summary "assistant text: $($item.text)"
                 } elseif ($item.type -eq "tool_use") {
                     $input = Get-EventProperty -Object $item -Name "input"
                     $filePath = Get-EventProperty -Object $input -Name "file_path"
@@ -295,6 +335,7 @@ function Invoke-WorkerProcess {
                         $target = " $command"
                     }
                     [Console]::Out.WriteLine("[claude tool] $($item.name)$target")
+                    Set-LastWorkerEvent -Summary "tool_use $($item.name)$target" -ToolName $item.name -ToolTarget $target
                 }
             }
             return
@@ -312,10 +353,13 @@ function Invoke-WorkerProcess {
             $stdout = Get-EventProperty -Object $toolUseResult -Name "stdout"
             if ($filePath) {
                 [Console]::Out.WriteLine("[claude tool-result] $resultType $filePath")
+                Set-LastWorkerEvent -Summary "tool_result $resultType $filePath"
             } elseif ($stdout) {
                 [Console]::Out.WriteLine("[claude tool-result] stdout")
+                Set-LastWorkerEvent -Summary "tool_result stdout: $stdout"
             } elseif ($resultType) {
                 [Console]::Out.WriteLine("[claude tool-result] $resultType")
+                Set-LastWorkerEvent -Summary "tool_result $resultType"
             }
             return
         }
@@ -327,6 +371,7 @@ function Invoke-WorkerProcess {
             $cost = if ($null -ne $costValue) { " cost=$costValue" } else { "" }
             $summary = if ($resultText) { " $resultText" } else { "" }
             [Console]::Out.WriteLine("[claude result] $subtype$cost$summary")
+            Set-LastWorkerEvent -Summary "result $subtype$cost$summary"
         }
     }
 
@@ -342,6 +387,7 @@ function Invoke-WorkerProcess {
 
         if ($IsError) {
             [Console]::Error.Write($Chunk)
+            Set-LastWorkerEvent -Summary "stderr: $Chunk"
             return
         }
 
@@ -367,14 +413,14 @@ function Invoke-WorkerProcess {
         )
 
         if (-not (Test-Path -LiteralPath $Path)) {
-            return
+            return $false
         }
 
         $readerStream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
             if ($readerStream.Length -le $Position.Value) {
                 $Position.Value = $readerStream.Length
-                return
+                return $false
             }
 
             [void]$readerStream.Seek([int64]$Position.Value, [System.IO.SeekOrigin]::Begin)
@@ -383,6 +429,7 @@ function Invoke-WorkerProcess {
                 $chunk = $reader.ReadToEnd()
                 $Position.Value = $readerStream.Position
                 Write-LiveChunk -Chunk $chunk -IsError $IsError
+                return ($chunk.Length -gt 0)
             } finally {
                 $reader.Dispose()
             }
@@ -394,14 +441,33 @@ function Invoke-WorkerProcess {
     [int64]$stdoutPosition = 0
     [int64]$stderrPosition = 0
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastOutputAt = Get-Date
+    $lastStdoutAt = $null
+    $lastStderrAt = $null
     $timedOut = $false
+    $idleTimedOut = $false
 
     while (-not $process.HasExited) {
-        Read-NewFileChunk -Path $StdoutPath -Position ([ref]$stdoutPosition) -IsError $false
-        Read-NewFileChunk -Path $StderrPath -Position ([ref]$stderrPosition) -IsError $true
+        $stdoutChanged = Read-NewFileChunk -Path $StdoutPath -Position ([ref]$stdoutPosition) -IsError $false
+        if ($stdoutChanged) {
+            $lastOutputAt = Get-Date
+            $lastStdoutAt = $lastOutputAt
+        }
+
+        $stderrChanged = Read-NewFileChunk -Path $StderrPath -Position ([ref]$stderrPosition) -IsError $true
+        if ($stderrChanged) {
+            $lastOutputAt = Get-Date
+            $lastStderrAt = $lastOutputAt
+        }
 
         if ((Get-Date) -gt $deadline) {
             $timedOut = $true
+            try { $process.Kill($true) } catch { }
+            break
+        }
+
+        if ($IdleTimeoutSeconds -gt 0 -and ((Get-Date) - $lastOutputAt).TotalSeconds -ge $IdleTimeoutSeconds) {
+            $idleTimedOut = $true
             try { $process.Kill($true) } catch { }
             break
         }
@@ -415,16 +481,32 @@ function Invoke-WorkerProcess {
     $stdoutFile.Dispose()
     $stderrFile.Dispose()
 
-    Read-NewFileChunk -Path $StdoutPath -Position ([ref]$stdoutPosition) -IsError $false
-    Read-NewFileChunk -Path $StderrPath -Position ([ref]$stderrPosition) -IsError $true
+    $stdoutChanged = Read-NewFileChunk -Path $StdoutPath -Position ([ref]$stdoutPosition) -IsError $false
+    if ($stdoutChanged) {
+        $lastOutputAt = Get-Date
+        $lastStdoutAt = $lastOutputAt
+    }
+
+    $stderrChanged = Read-NewFileChunk -Path $StderrPath -Position ([ref]$stderrPosition) -IsError $true
+    if ($stderrChanged) {
+        $lastOutputAt = Get-Date
+        $lastStderrAt = $lastOutputAt
+    }
     if ($LiveOutput -and $Backend -eq "claude" -and -not $RawLiveOutput -and $script:claudeLiveBuffer) {
         Write-ClaudeLiveLine -Line $script:claudeLiveBuffer
         $script:claudeLiveBuffer = ""
     }
 
     return @{
-        exit_code = if ($timedOut) { 124 } else { $process.ExitCode }
+        exit_code = if ($timedOut -or $idleTimedOut) { 124 } else { $process.ExitCode }
         timed_out = $timedOut
+        idle_timed_out = $idleTimedOut
+        last_output_at = $lastOutputAt.ToString("o")
+        last_stdout_at = if ($lastStdoutAt) { $lastStdoutAt.ToString("o") } else { $null }
+        last_stderr_at = if ($lastStderrAt) { $lastStderrAt.ToString("o") } else { $null }
+        last_event_summary = $script:opencodeWorkerLastEventSummary
+        last_tool_name = $script:opencodeWorkerLastToolName
+        last_tool_target = $script:opencodeWorkerLastToolTarget
     }
 }
 
@@ -466,6 +548,7 @@ $report = @{
     model = $Model
     permission_mode = if ($Backend -eq "claude") { $PermissionMode } else { $null }
     max_budget_usd = if ($Backend -eq "claude") { $claudeBudget } else { $null }
+    idle_timeout_sec = $IdleTimeoutSec
     live_output = $liveOutput
     raw_live_output = $RawLiveOutput.IsPresent
     worker_command = @()
@@ -481,6 +564,12 @@ $report = @{
     report_path = $reportPath
     claude_version = $null
     claude_auth_status = $null
+    last_output_at = $null
+    last_stdout_at = $null
+    last_stderr_at = $null
+    last_event_summary = ""
+    last_tool_name = ""
+    last_tool_target = ""
 }
 
 try {
@@ -612,8 +701,14 @@ $taskContent
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $worktree) | Out-Null
     Invoke-Git -Arguments @("-C", $gitRoot, "worktree", "add", "-b", $branch, $worktree, "HEAD") | Out-Null
 
-    $processResult = Invoke-WorkerProcess -FilePath $workerCommand -Arguments $workerArgs -WorkingDirectory $worktree -StdoutPath $stdoutPath -StderrPath $stderrPath -TimeoutSeconds $TimeoutSec -StandardInputText $stdinText -LiveOutput $liveOutput -RawLiveOutput $RawLiveOutput.IsPresent -Backend $Backend
+    $processResult = Invoke-WorkerProcess -FilePath $workerCommand -Arguments $workerArgs -WorkingDirectory $worktree -StdoutPath $stdoutPath -StderrPath $stderrPath -TimeoutSeconds $TimeoutSec -IdleTimeoutSeconds $IdleTimeoutSec -StandardInputText $stdinText -LiveOutput $liveOutput -RawLiveOutput $RawLiveOutput.IsPresent -Backend $Backend
     $report.worker_exit_code = $processResult.exit_code
+    $report.last_output_at = $processResult.last_output_at
+    $report.last_stdout_at = $processResult.last_stdout_at
+    $report.last_stderr_at = $processResult.last_stderr_at
+    $report.last_event_summary = $processResult.last_event_summary
+    $report.last_tool_name = $processResult.last_tool_name
+    $report.last_tool_target = $processResult.last_tool_target
     if ($Backend -eq "opencode") {
         $report.opencode_exit_code = $processResult.exit_code
     }
@@ -625,6 +720,12 @@ $taskContent
         $report.diff_stat = ($report.status_porcelain -join [Environment]::NewLine)
     }
     $report.sensitive_changed_files = @($report.changed_files | Where-Object { Test-SensitivePath -Path $_ })
+
+    if ($processResult.idle_timed_out) {
+        $report.status = "idle_timeout"
+        $report.message = "$Backend produced no output for $IdleTimeoutSec seconds."
+        Write-ReportAndExit -Report $report -Code 124
+    }
 
     if ($processResult.timed_out) {
         $report.status = "timeout"
